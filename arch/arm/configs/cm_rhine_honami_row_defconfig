@@ -45,6 +45,11 @@ CONFIG_TCP_CONG_ILLINOIS=y
 CONFIG_DEFAULT_TCP_CONG="westwood"
 
 #
+# Power Management
+#
+CONFIG_POWERSUSPEND=y
+
+#
 # Voltage Control 
 #
 CONFIG_CPU_VDD_CONTROL=y
