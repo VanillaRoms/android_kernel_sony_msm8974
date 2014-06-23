@@ -303,8 +303,13 @@ static int __cpuinit msm_cpufreq_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
+#ifdef CONFIG_CPU_FREQ_GOV_INTELLIDEMAND
+extern bool lmf_screen_state;
+#endif
+
 static int __cpuinit msm_cpufreq_cpu_callback(struct notifier_block *nfb,
 		unsigned long action, void *hcpu)
+
 {
 	unsigned int cpu = (unsigned long)hcpu;
 	int rc;

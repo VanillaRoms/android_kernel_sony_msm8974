@@ -274,6 +274,8 @@
 #define SEC_XFER_SIZE 512
 #define EXTRACT_SIZE 10
 
+#define LONGS(x) (((x) + sizeof(unsigned long) - 1)/sizeof(unsigned long))
+
 /*
  * The minimum number of bits of entropy before we wake up a read on
  * /dev/random.  Should be enough to do a significant reseed.
@@ -554,21 +556,26 @@ struct fast_pool {
  * collector.  It's hardcoded for an 128 bit pool and assumes that any
  * locks that might be needed are taken by the caller.
  */
-static void fast_mix(struct fast_pool *f, const void *in, int nbytes)
+static void fast_mix(struct fast_pool *f, __u32 input[4])
 {
-	const char	*bytes = in;
 	__u32		w;
-	unsigned	i = f->count;
 	unsigned	input_rotate = f->rotate;
 
-	while (nbytes--) {
-		w = rol32(*bytes++, input_rotate & 31) ^ f->pool[i & 3] ^
-			f->pool[(i + 1) & 3];
-		f->pool[i & 3] = (w >> 3) ^ twist_table[w & 7];
-		input_rotate += (i++ & 3) ? 7 : 14;
-	}
-	f->count = i;
+	w = rol32(input[0], input_rotate) ^ f->pool[0] ^ f->pool[3];
+	f->pool[0] = (w >> 3) ^ twist_table[w & 7];
+	input_rotate = (input_rotate + 14) & 31;
+	w = rol32(input[1], input_rotate) ^ f->pool[1] ^ f->pool[0];
+	f->pool[1] = (w >> 3) ^ twist_table[w & 7];
+	input_rotate = (input_rotate + 7) & 31;
+	w = rol32(input[2], input_rotate) ^ f->pool[2] ^ f->pool[1];
+	f->pool[2] = (w >> 3) ^ twist_table[w & 7];
+	input_rotate = (input_rotate + 7) & 31;
+	w = rol32(input[3], input_rotate) ^ f->pool[3] ^ f->pool[2];
+	f->pool[3] = (w >> 3) ^ twist_table[w & 7];
+	input_rotate = (input_rotate + 7) & 31;
+
 	f->rotate = input_rotate;
+	f->count++;
 }
 
 /*
@@ -619,6 +626,8 @@ struct timer_rand_state {
 	unsigned dont_count_entropy:1;
 };
 
+#define INIT_TIMER_RAND_STATE { INITIAL_JIFFIES, };
+
 /*
  * Add device- or boot-specific data to the input and nonblocking
  * pools to help initialize them to unique values.
@@ -629,7 +638,7 @@ struct timer_rand_state {
  */
 void add_device_randomness(const void *buf, unsigned int size)
 {
-	unsigned long time = get_cycles() ^ jiffies;
+	unsigned long time = random_get_entropy() ^ jiffies;
 
 	mix_pool_bytes(&input_pool, buf, size, NULL);
 	mix_pool_bytes(&input_pool, &time, sizeof(time), NULL);
@@ -638,7 +647,7 @@ void add_device_randomness(const void *buf, unsigned int size)
 }
 EXPORT_SYMBOL(add_device_randomness);
 
-static struct timer_rand_state input_timer_state;
+static struct timer_rand_state input_timer_state = INIT_TIMER_RAND_STATE;
 
 /*
  * This function adds entropy to the entropy "pool" by using timing
@@ -652,6 +661,7 @@ static struct timer_rand_state input_timer_state;
  */
 static void add_timer_randomness(struct timer_rand_state *state, unsigned num)
 {
+	struct entropy_store	*r;
 	struct {
 		long jiffies;
 		unsigned cycles;
@@ -666,9 +676,10 @@ static void add_timer_randomness(struct timer_rand_state *state, unsigned num)
 		goto out;
 
 	sample.jiffies = jiffies;
-	sample.cycles = get_cycles();
+	sample.cycles = random_get_entropy();
 	sample.num = num;
-	mix_pool_bytes(&input_pool, &sample, sizeof(sample), NULL);
+	r = nonblocking_pool.initialized ? &input_pool : &nonblocking_pool;
+	mix_pool_bytes(r, &sample, sizeof(sample), NULL);
 
 	/*
 	 * Calculate number of bits of randomness we probably added.
@@ -702,8 +713,7 @@ static void add_timer_randomness(struct timer_rand_state *state, unsigned num)
 		 * Round down by 1 bit on general principles,
 		 * and limit entropy entimate to 12 bits.
 		 */
-		credit_entropy_bits(&input_pool,
-				    min_t(int, fls(delta>>1), 11));
+		credit_entropy_bits(r, min_t(int, fls(delta>>1), 11));
 	}
 out:
 	preempt_enable();
@@ -733,20 +743,21 @@ void add_interrupt_randomness(int irq, int irq_flags)
 	struct fast_pool	*fast_pool = &__get_cpu_var(irq_randomness);
 	struct pt_regs		*regs = get_irq_regs();
 	unsigned long		now = jiffies;
-	__u32			input[4], cycles = get_cycles();
+	cycles_t		cycles = random_get_entropy();
+	__u32			input[4], c_high, j_high;
+	__u64			ip;
 
-	input[0] = cycles ^ jiffies;
-	input[1] = irq;
-	if (regs) {
-		__u64 ip = instruction_pointer(regs);
-		input[2] = ip;
-		input[3] = ip >> 32;
-	}
+	c_high = (sizeof(cycles) > 4) ? cycles >> 32 : 0;
+	j_high = (sizeof(now) > 4) ? now >> 32 : 0;
+	input[0] = cycles ^ j_high ^ irq;
+	input[1] = now ^ c_high;
+	ip = regs ? instruction_pointer(regs) : _RET_IP_;
+	input[2] = ip;
+	input[3] = ip >> 32;
 
-	fast_mix(fast_pool, input, sizeof(input));
+	fast_mix(fast_pool, input);
 
-	if ((fast_pool->count & 1023) &&
-	    !time_after(now, fast_pool->last + HZ))
+	if ((fast_pool->count & 63) && !time_after(now, fast_pool->last + HZ))
 		return;
 
 	fast_pool->last = now;
@@ -798,11 +809,7 @@ static ssize_t extract_entropy(struct entropy_store *r, void *buf,
  */
 static void xfer_secondary_pool(struct entropy_store *r, size_t nbytes)
 {
-	union {
-		__u32	tmp[OUTPUT_POOL_WORDS];
-		long	hwrand[4];
-	} u;
-	int	i;
+	__u32	tmp[OUTPUT_POOL_WORDS];
 
 	if (r->pull && r->entropy_count < nbytes * 8 &&
 	    r->entropy_count < r->poolinfo->POOLBITS) {
@@ -813,23 +820,17 @@ static void xfer_secondary_pool(struct entropy_store *r, size_t nbytes)
 		/* pull at least as many as BYTES as wakeup BITS */
 		bytes = max_t(int, bytes, random_read_wakeup_thresh / 8);
 		/* but never more than the buffer size */
-		bytes = min_t(int, bytes, sizeof(u.tmp));
+		bytes = min_t(int, bytes, sizeof(tmp));
 
 		DEBUG_ENT("going to reseed %s with %d bits "
 			  "(%d of %d requested)\n",
 			  r->name, bytes * 8, nbytes * 8, r->entropy_count);
 
-		bytes = extract_entropy(r->pull, u.tmp, bytes,
+		bytes = extract_entropy(r->pull, tmp, bytes,
 					random_read_wakeup_thresh / 8, rsvd);
-		mix_pool_bytes(r, u.tmp, bytes, NULL);
+		mix_pool_bytes(r, tmp, bytes, NULL);
 		credit_entropy_bits(r, bytes*8);
 	}
-	kmemcheck_mark_initialized(&u.hwrand, sizeof(u.hwrand));
-	for (i = 0; i < 4; i++)
-		if (arch_get_random_long(&u.hwrand[i]))
-			break;
-	if (i)
-		mix_pool_bytes(r, &u.hwrand, sizeof(u.hwrand), 0);
 }
 
 /*
@@ -886,15 +887,19 @@ static size_t account(struct entropy_store *r, size_t nbytes, int min,
 static void extract_buf(struct entropy_store *r, __u8 *out)
 {
 	int i;
-	__u32 hash[5], workspace[SHA_WORKSPACE_WORDS];
+	union {
+		__u32 w[5];
+		unsigned long l[LONGS(EXTRACT_SIZE)];
+	} hash;
+	__u32 workspace[SHA_WORKSPACE_WORDS];
 	__u8 extract[64];
 	unsigned long flags;
 
 	/* Generate a hash across the pool, 16 words (512 bits) at a time */
-	sha_init(hash);
+	sha_init(hash.w);
 	spin_lock_irqsave(&r->lock, flags);
 	for (i = 0; i < r->poolinfo->poolwords; i += 16)
-		sha_transform(hash, (__u8 *)(r->pool + i), workspace);
+		sha_transform(hash.w, (__u8 *)(r->pool + i), workspace);
 
 	/*
 	 * We mix the hash back into the pool to prevent backtracking
@@ -905,14 +910,14 @@ static void extract_buf(struct entropy_store *r, __u8 *out)
 	 * brute-forcing the feedback as hard as brute-forcing the
 	 * hash.
 	 */
-	__mix_pool_bytes(r, hash, sizeof(hash), extract);
+	__mix_pool_bytes(r, hash.w, sizeof(hash.w), extract);
 	spin_unlock_irqrestore(&r->lock, flags);
 
 	/*
 	 * To avoid duplicates, we atomically extract a portion of the
 	 * pool while mixing, and hash one final time.
 	 */
-	sha_transform(hash, extract, workspace);
+	sha_transform(hash.w, extract, workspace);
 	memset(extract, 0, sizeof(extract));
 	memset(workspace, 0, sizeof(workspace));
 
@@ -921,11 +926,23 @@ static void extract_buf(struct entropy_store *r, __u8 *out)
 	 * pattern, we fold it in half. Thus, we always feed back
 	 * twice as much data as we output.
 	 */
-	hash[0] ^= hash[3];
-	hash[1] ^= hash[4];
-	hash[2] ^= rol32(hash[2], 16);
-	memcpy(out, hash, EXTRACT_SIZE);
-	memset(hash, 0, sizeof(hash));
+	hash.w[0] ^= hash.w[3];
+	hash.w[1] ^= hash.w[4];
+	hash.w[2] ^= rol32(hash.w[2], 16);
+
+	/*
+	 * If we have a architectural hardware random number
+	 * generator, mix that in, too.
+	 */
+	for (i = 0; i < LONGS(EXTRACT_SIZE); i++) {
+		unsigned long v;
+		if (!arch_get_random_long(&v))
+			break;
+		hash.l[i] ^= v;
+	}
+
+	memcpy(out, &hash, EXTRACT_SIZE);
+	memset(&hash, 0, sizeof(hash));
 }
 
 static ssize_t extract_entropy(struct entropy_store *r, void *buf,
@@ -1088,8 +1105,10 @@ void rand_initialize_disk(struct gendisk *disk)
 	 * source.
 	 */
 	state = kzalloc(sizeof(struct timer_rand_state), GFP_KERNEL);
-	if (state)
+	if (state) {
+		state->last_time = INITIAL_JIFFIES;
 		disk->random = state;
+	}
 }
 #endif
 
@@ -1423,7 +1442,7 @@ unsigned int get_random_int(void)
 
 	hash = get_cpu_var(get_random_int_hash);
 
-	hash[0] += current->pid + jiffies + get_cycles();
+	hash[0] += current->pid + jiffies + random_get_entropy();
 	md5_transform(hash, random_int_secret);
 	ret = hash[0];
 	put_cpu_var(get_random_int_hash);
